@@ -13,12 +13,6 @@ __pycache__/
 venv/
 ENV/
 
-# Data files (too large)
-data/historical/*.parquet
-
-# Models (too large)
-models/*.pth
-
 # Node
 node_modules/
 frontend/node_modules/
