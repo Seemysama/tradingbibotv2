@@ -13,6 +13,9 @@ __pycache__/
 venv/
 ENV/
 
+# Data files (too large for GitHub)
+data/historical/*.parquet
+
 # Node
 node_modules/
 frontend/node_modules/
