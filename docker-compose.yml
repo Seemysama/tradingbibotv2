@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  questdb:
+    image: questdb/questdb:latest
+    container_name: questdb_mac
+    restart: unless-stopped
+    ports:
+      - "9000:9000"  # Console Web & REST
+      - "9009:9009"  # ILP (Ingestion haute fréquence)
+      - "8812:8812"  # Postgres Wire
+    volumes:
+      - ./data/questdb_root:/var/lib/questdb
+    environment:
+      - QDB_TELEMETRY_ENABLED=false
