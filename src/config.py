@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     RSI_WINDOW: int = 14
     ATR_WINDOW: int = 14
     ADX_WINDOW: int = 14
+    
+    # Nouveaux paramètres - Stratégie Hybride
+    EMA_FAST: int = 12
+    EMA_SLOW: int = 26
+    ADX_THRESHOLD: float = 25.0  # Seuil pour détecter un marché directionnel
+    RSI_OVERSOLD: float = 30.0
+    RSI_OVERBOUGHT: float = 70.0
+    ATR_MULTIPLIER_SL: float = 1.5  # Stop Loss = Entry ± (ATR * multiplier)
+    RISK_REWARD_RATIO: float = 2.0  # TP = SL * ratio (ex: risque 1, gain 2)
 
     # QuestDB (optionnel)
     QUESTDB_ENABLED: bool = False

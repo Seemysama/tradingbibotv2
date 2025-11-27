@@ -354,19 +354,34 @@ async def trading_loop_live(symbol: str):
                 # Mise à jour de la stratégie
                 signal = bot_state["strategy"].update(candle_dict)
                 
-                log.info(f"📊 {symbol} @ ${current_price:,.2f} | Signal: {signal.direction or 'HOLD'} ({signal.confidence:.1%})")
+                regime_info = getattr(signal, 'regime', 'N/A')
+                log.info(f"📊 {symbol} @ ${current_price:,.2f} | [{regime_info}] {signal.direction or 'HOLD'} ({signal.confidence:.1%}) | {signal.reason}")
                 
-                # Gestion des positions (paper trading même en LIVE pour la démo)
+                # Gestion des positions avec SL/TP dynamiques
                 now = datetime.now().isoformat()
                 
                 if position:
-                    if position["side"] == "long":
-                        pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
+                    # Vérifier SL/TP dynamiques si disponibles
+                    sl = position.get("stop_loss", 0)
+                    tp = position.get("take_profit", 0)
+                    
+                    exit_reason = None
+                    if sl > 0 and tp > 0:
+                        exit_reason = bot_state["execution"].check_exit_conditions(
+                            current_price, 
+                            position["entry_price"], 
+                            sl, tp, 
+                            position["side"]
+                        )
                     else:
-                        pnl_pct = (position["entry_price"] - current_price) / position["entry_price"]
+                        # Fallback sur % si pas de SL/TP absolus
+                        if position["side"] == "long":
+                            pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
+                        else:
+                            pnl_pct = (position["entry_price"] - current_price) / position["entry_price"]
+                        exit_reason = bot_state["execution"].should_exit(pnl_pct)
                     
-                    exit_reason = bot_state["execution"].should_exit(pnl_pct)
-                    
+                    # Sortie si signal inverse
                     should_close = exit_reason or \
                         (signal.direction == "short" and position["side"] == "long") or \
                         (signal.direction == "long" and position["side"] == "short")
@@ -397,37 +412,55 @@ async def trading_loop_live(symbol: str):
                         bot_state["trades"].append(trade)
                         bot_state["equity_curve"].append({"timestamp": now, "equity": bot_state["balance"]})
                         
-                        log.info(f"🔴 CLOSE {position['side'].upper()} @ ${current_price:,.2f} | PnL: ${pnl:.2f}")
+                        log.info(f"🔴 CLOSE {position['side'].upper()} @ ${current_price:,.2f} | PnL: ${pnl:.2f} | {exit_reason or signal.reason}")
                         
                         position = None
                         bot_state["current_position"] = None
+                        bot_state["execution"].reset_exposure()  # Reset exposition
                         await broadcast_update({"type": "trade", "data": trade})
                 
-                if not position and signal.direction and signal.confidence > 0:
-                    notional = bot_state["balance"] * 0.05
-                    quantity = notional / current_price
+                if not position and signal.direction and signal.confidence > 0.5:
+                    # Utiliser le position sizing professionnel
+                    sl_price = getattr(signal, 'stop_loss', current_price * 0.99)
+                    tp_price = getattr(signal, 'take_profit', current_price * 1.02)
                     
-                    position = {
-                        "side": signal.direction,
-                        "entry_price": current_price,
-                        "quantity": quantity,
-                        "entry_time": now
-                    }
-                    bot_state["current_position"] = position
+                    # Vérifications pré-trade
+                    trade_check = bot_state["execution"].pre_trade_checks(
+                        current_balance=bot_state["balance"],
+                        entry_price=current_price,
+                        stop_loss=sl_price,
+                        spread=0.0  # TODO: calculer le spread réel
+                    )
                     
-                    trade = {
-                        "timestamp": now,
-                        "symbol": symbol,
-                        "side": signal.direction,
-                        "price": current_price,
-                        "quantity": quantity,
-                        "pnl": None,
-                        "reason": signal.reason
-                    }
-                    bot_state["trades"].append(trade)
-                    
-                    log.info(f"🟢 OPEN {signal.direction.upper()} @ ${current_price:,.2f} | {signal.reason}")
-                    await broadcast_update({"type": "trade", "data": trade})
+                    if not trade_check.allowed:
+                        log.info(f"⚠️ Trade refusé: {trade_check.reason}")
+                    else:
+                        quantity = trade_check.quantity
+                        
+                        position = {
+                            "side": signal.direction,
+                            "entry_price": current_price,
+                            "quantity": quantity,
+                            "entry_time": now,
+                            "stop_loss": sl_price,
+                            "take_profit": tp_price
+                        }
+                        bot_state["current_position"] = position
+                        bot_state["execution"].record_trade(quantity * current_price / bot_state["balance"])
+                        
+                        trade = {
+                            "timestamp": now,
+                            "symbol": symbol,
+                            "side": signal.direction,
+                            "price": current_price,
+                            "quantity": quantity,
+                            "pnl": None,
+                            "reason": signal.reason
+                        }
+                        bot_state["trades"].append(trade)
+                        
+                        log.info(f"🟢 OPEN {signal.direction.upper()} @ ${current_price:,.2f} | SL: ${sl_price:,.2f} | TP: ${tp_price:,.2f} | {signal.reason}")
+                        await broadcast_update({"type": "trade", "data": trade})
                 
                 await asyncio.sleep(5)  # Check toutes les 5 secondes
                 
