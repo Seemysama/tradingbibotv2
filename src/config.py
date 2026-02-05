@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import List, Literal, Optional
+from enum import Enum
 
 import torch
 from pydantic import field_validator
@@ -15,6 +16,11 @@ def detect_device() -> str:
     return "cpu"
 
 
+class ExchangeType(str, Enum):
+    BINANCE = "binance"
+    POLYMARKET = "polymarket"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -24,9 +30,17 @@ class Settings(BaseSettings):
     LOGGER_LEVEL: str = "INFO"
     
     # API Exchange
+    # API Exchange - CEX
     BINANCE_API_KEY: Optional[str] = None
     BINANCE_API_SECRET: Optional[str] = None
-    EXCHANGE: str = "binance"  # Exchange à utiliser
+    
+    # API Exchange - Polymarket
+    POLYMARKET_API_KEY: Optional[str] = None
+    POLYMARKET_SECRET: Optional[str] = None
+    POLYMARKET_PASSPHRASE: Optional[str] = None
+    POLYMARKET_PRIVATE_KEY: Optional[str] = None  # Hex key for L1 signing
+    
+    EXCHANGE_TYPE: ExchangeType = ExchangeType.BINANCE
     USE_SANDBOX: bool = True  # Mode sandbox pour tests
     
     # Chemins données
@@ -102,6 +116,21 @@ class Settings(BaseSettings):
         return v.upper()
 
     @field_validator("BINANCE_API_KEY", "BINANCE_API_SECRET")
+    @classmethod
+    def _require_keys_for_live_binance(cls, v: Optional[str], info):
+        values = info.data
+        if values.get("MODE", "PAPER").upper() == "LIVE" and values.get("EXCHANGE_TYPE") == ExchangeType.BINANCE and not v:
+            raise ValueError(f"Clé requise en mode LIVE Binance: {info.field_name}")
+        return v
+
+    @field_validator("POLYMARKET_API_KEY", "POLYMARKET_SECRET", "POLYMARKET_PASSPHRASE", "POLYMARKET_PRIVATE_KEY")
+    @classmethod
+    def _require_keys_for_live_polymarket(cls, v: Optional[str], info):
+        values = info.data
+        if values.get("MODE", "PAPER").upper() == "LIVE" and values.get("EXCHANGE_TYPE") == ExchangeType.POLYMARKET and not v:
+             # Private key is needed for L2 Auth derivation too
+            raise ValueError(f"Clé requise en mode LIVE Polymarket: {info.field_name}")
+        return v
     @classmethod
     def _require_keys_for_live(cls, v: Optional[str], info):
         values = info.data

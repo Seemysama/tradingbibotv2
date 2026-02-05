@@ -1,10 +1,12 @@
 """
-Stratégie Hybride : Regime Detection -> Technical Signal -> ML Validation.
+Stratégie Hybride V2 : Regime Detection -> Technical Signal -> ML Validation.
 
 Architecture à 3 étages :
 1. Détection de Régime (ADX) : TREND vs RANGE
 2. Signal Technique : EMA Cross (Trend) ou Bollinger Rebound (Range)
-3. Validation ML : Le LSTM agit comme un "veto" ou boost de confiance
+3. Validation ML : Le Transformer agit comme un "veto" ou boost de confiance
+
+Mode "ML Pure" disponible: Le Transformer décide seul.
 """
 
 import logging
@@ -30,21 +32,30 @@ class Signal:
     stop_loss: float = 0.0
     take_profit: float = 0.0
     regime: str = "NONE"  # "TREND" ou "RANGE"
+    ml_probability: float = 0.5  # Nouvelle: probabilité ML
 
 
 class HybridStrategy:
     """
-    Stratégie Hybride : Regime Detection -> Technical Signal -> ML Validation.
+    Stratégie Hybride V2: Regime Detection -> Technical Signal -> ML Validation.
     
-    Logique:
-    - Si ADX > 25 → Marché directionnel → On cherche des croisements EMA
-    - Si ADX < 25 → Marché oscillant → On cherche des rebonds Bollinger
-    - ML valide ou veto le signal technique
+    Deux modes:
+    1. HYBRID: Le ML valide/veto les signaux techniques (défaut)
+    2. ML_PURE: Le Transformer décide seul (activé par settings.ML_PURE_MODE)
+    
+    Le TransformerPro binaire prédit P(UP) = probabilité de hausse.
     """
 
-    def __init__(self, inference: Optional[InferenceEngine] = None, max_candles: int = 300) -> None:
+    def __init__(self, inference: Optional[InferenceEngine] = None, max_candles: int = 500) -> None:
         self.inference = inference or InferenceEngine()
         self.buffer: Deque[dict] = deque(maxlen=max_candles)
+        
+        # Mode ML Pure (optionnel)
+        self.ml_pure_mode = getattr(settings, 'ML_PURE_MODE', False)
+        
+        # Seuils ML (probabilité de hausse)
+        self.ml_long_threshold = getattr(settings, 'ML_LONG_THRESHOLD', 0.55)
+        self.ml_short_threshold = getattr(settings, 'ML_SHORT_THRESHOLD', 0.45)
 
     def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calcul vectorisé des indicateurs nécessaires."""
@@ -125,6 +136,10 @@ class HybridStrategy:
         price = float(curr["close"])
         atr = float(curr["atr"]) if curr["atr"] > 0 else price * 0.01  # Fallback 1%
         
+        # 0. Mode ML Pure - Le Transformer décide seul
+        if self.ml_pure_mode and settings.ML_ENABLED:
+            return self._ml_pure_decision(df, price, atr)
+        
         # 1. Détection de Régime
         adx_value = float(curr["adx"]) if not np.isnan(curr["adx"]) else 20.0
         regime = "TREND" if adx_value > settings.ADX_THRESHOLD else "RANGE"
@@ -178,34 +193,46 @@ class HybridStrategy:
                 regime=regime
             )
 
-        # 3. Validation ML (Oracle)
+        # 3. Validation ML V2 (TransformerPro binaire)
+        ml_prob = 0.5  # Probabilité par défaut
         if settings.ML_ENABLED:
             try:
-                ml_score, ml_ready = self.inference.predict()
+                ml_prob, ml_ready = self.inference.predict()
                 
                 if ml_ready:
-                    # Si ML contredit fortement le technique, on veto
-                    if direction == "long" and ml_score < 0.4:
+                    # ML prédit P(UP) = probabilité de hausse
+                    # Si direction=LONG et P(UP) < seuil_short => VETO
+                    # Si direction=SHORT et P(UP) > seuil_long => VETO
+                    
+                    if direction == "long" and ml_prob < self.ml_short_threshold:
                         return Signal(
                             direction=None, 
                             confidence=0.0, 
-                            reason=f"VETO ML ({ml_score:.2f}) vs LONG",
+                            reason=f"VETO ML: P(UP)={ml_prob:.1%} vs LONG",
                             price=price,
-                            regime=regime
+                            regime=regime,
+                            ml_probability=ml_prob
                         )
-                    elif direction == "short" and ml_score > 0.6:
+                    elif direction == "short" and ml_prob > self.ml_long_threshold:
                         return Signal(
                             direction=None, 
                             confidence=0.0, 
-                            reason=f"VETO ML ({ml_score:.2f}) vs SHORT",
+                            reason=f"VETO ML: P(UP)={ml_prob:.1%} vs SHORT",
                             price=price,
-                            regime=regime
+                            regime=regime,
+                            ml_probability=ml_prob
                         )
                     
-                    # Boost de confiance si ML confirme
-                    if (direction == "long" and ml_score > 0.6) or (direction == "short" and ml_score < 0.4):
+                    # Boost de confiance si ML confirme fortement
+                    if direction == "long" and ml_prob > 0.6:
                         confidence += 0.15
-                        reason += f" | ML={ml_score:.0%}"
+                        reason += f" | ML P(UP)={ml_prob:.0%}✓"
+                    elif direction == "short" and ml_prob < 0.4:
+                        confidence += 0.15
+                        reason += f" | ML P(DOWN)={1-ml_prob:.0%}✓"
+                    else:
+                        reason += f" | ML P(UP)={ml_prob:.0%}"
+                        
             except Exception as e:
                 log.warning(f"ML inference error: {e}")
 
@@ -228,5 +255,79 @@ class HybridStrategy:
             price=price, 
             stop_loss=sl_price, 
             take_profit=tp_price, 
-            regime=regime
+            regime=regime,
+            ml_probability=ml_prob
         )
+
+    def _ml_pure_decision(self, df: pd.DataFrame, price: float, atr: float) -> Signal:
+        """
+        Mode ML Pure: Le Transformer décide seul, sans analyse technique.
+        
+        Logique:
+        - P(UP) >= 0.55 → LONG
+        - P(UP) <= 0.45 → SHORT
+        - Sinon → NEUTRAL
+        """
+        try:
+            ml_prob, ml_ready = self.inference.predict()
+            
+            if not ml_ready:
+                return Signal(
+                    direction=None,
+                    confidence=0.0,
+                    reason="ML Warmup...",
+                    price=price,
+                    regime="ML_PURE"
+                )
+            
+            # Décision basée sur probabilité
+            if ml_prob >= self.ml_long_threshold:
+                direction = "long"
+                confidence = (ml_prob - 0.5) * 2  # Scale 0.5-1.0 → 0-1
+                reason = f"ML PURE: P(UP)={ml_prob:.1%}"
+            elif ml_prob <= self.ml_short_threshold:
+                direction = "short"
+                confidence = (0.5 - ml_prob) * 2  # Scale 0-0.5 → 0-1
+                reason = f"ML PURE: P(DOWN)={1-ml_prob:.1%}"
+            else:
+                return Signal(
+                    direction=None,
+                    confidence=0.0,
+                    reason=f"ML NEUTRAL: P(UP)={ml_prob:.1%}",
+                    price=price,
+                    regime="ML_PURE",
+                    ml_probability=ml_prob
+                )
+            
+            # Calcul des objectifs ATR
+            if direction == "long":
+                sl_price = price - (atr * settings.ATR_MULTIPLIER_SL)
+                risk = price - sl_price
+                tp_price = price + (risk * settings.RISK_REWARD_RATIO)
+            else:
+                sl_price = price + (atr * settings.ATR_MULTIPLIER_SL)
+                risk = sl_price - price
+                tp_price = price - (risk * settings.RISK_REWARD_RATIO)
+            
+            log.info(f"🤖 ML PURE: {direction.upper()} @ ${price:,.2f} | P(UP)={ml_prob:.1%}")
+            
+            return Signal(
+                direction=direction,
+                confidence=min(confidence, 0.95),
+                reason=reason,
+                price=price,
+                stop_loss=sl_price,
+                take_profit=tp_price,
+                regime="ML_PURE",
+                ml_probability=ml_prob
+            )
+            
+        except Exception as e:
+            log.error(f"ML Pure decision error: {e}")
+            return Signal(
+                direction=None,
+                confidence=0.0,
+                reason=f"ML Error: {e}",
+                price=price,
+                regime="ML_PURE"
+            )

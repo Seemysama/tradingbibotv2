@@ -77,6 +77,130 @@ class StartRequest(BaseModel):
     mode: str = "paper"  # paper | backtest | live
 
 
+# -----------------------------------------------------------------------------
+# Orchestration des runs d'entraînement (Lab)
+# -----------------------------------------------------------------------------
+class RunRequest(BaseModel):
+    data: str = "data/massive/BTC_USDT_5m_FULL.parquet"
+    epochs: int = 20
+    batch_size: int = 512
+    seq_length: int = 64
+    n_splits: int = 3
+    device: Optional[str] = None  # "cuda" | "cpu" | None (auto)
+
+
+class RunStatus(BaseModel):
+    run_id: Optional[str]
+    status: str
+    pid: Optional[int]
+    params: Optional[dict]
+    start_time: Optional[str]
+    end_time: Optional[str]
+    log_path: Optional[str]
+    metrics_path: Optional[str]
+    last_lines: List[str] = []
+    history: List[dict] = []
+
+
+run_state: Dict[str, Optional[str]] = {
+    "run_id": None,
+    "status": "idle",  # idle | running | finished | failed
+    "pid": None,
+    "params": None,
+    "start_time": None,
+    "end_time": None,
+    "log_path": None,
+    "metrics_path": None,
+    "return_code": None,
+}
+run_history: List[dict] = []
+
+
+async def _run_training_job(cfg: RunRequest):
+    """Lance train_v2.py en sous-processus et suit l'état."""
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = f"run_{run_ts}"
+    output_dir = Path("models/lab_runs") / run_id
+    log_dir = Path("logs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{run_id}.log"
+
+    cmd = [
+        sys.executable,
+        "train_v2.py",
+        "--data", cfg.data,
+        "--epochs", str(cfg.epochs),
+        "--batch-size", str(cfg.batch_size),
+        "--seq-length", str(cfg.seq_length),
+        "--n-splits", str(cfg.n_splits),
+        "--output", str(output_dir),
+    ]
+    if cfg.device:
+        cmd += ["--device", cfg.device]
+
+    run_state.update({
+        "run_id": run_id,
+        "status": "running",
+        "params": cfg.dict(),
+        "start_time": datetime.now().isoformat(),
+        "end_time": None,
+        "pid": None,
+        "log_path": str(log_path),
+        "metrics_path": None,
+        "return_code": None,
+    })
+
+    try:
+        with log_path.open("w") as log_file:
+            log.info(f"🚀 Lancement training job {run_id}: {' '.join(cmd)}")
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=log_file,
+                stderr=log_file,
+            )
+            run_state["pid"] = proc.pid
+            rc = await proc.wait()
+            run_state["return_code"] = rc
+    except Exception as exc:  # pragma: no cover - garde-fou
+        run_state["status"] = "failed"
+        run_state["end_time"] = datetime.now().isoformat()
+        run_state["return_code"] = -1
+        log.error(f"❌ Erreur job {run_id}: {exc}")
+        return
+
+    run_state["end_time"] = datetime.now().isoformat()
+
+    # Charger métriques si dispo
+    metrics_path = output_dir / "metrics_v2.json"
+    if metrics_path.exists():
+        run_state["metrics_path"] = str(metrics_path)
+        run_state["status"] = "finished" if run_state.get("return_code", 1) == 0 else "failed"
+        try:
+            import json
+            with metrics_path.open() as f:
+                metrics = json.load(f)
+        except Exception:
+            metrics = None
+    else:
+        metrics = None
+        run_state["status"] = "failed"
+
+    # Historique
+    history_entry = {
+        "run_id": run_id,
+        "status": run_state["status"],
+        "params": cfg.dict(),
+        "metrics_path": run_state.get("metrics_path"),
+        "start_time": run_state["start_time"],
+        "end_time": run_state["end_time"],
+        "return_code": run_state.get("return_code"),
+        "metrics": metrics,
+    }
+    run_history.append(history_entry)
+    # conserver les 20 derniers runs
+    if len(run_history) > 20:
+        run_history.pop(0)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialise et nettoie les ressources"""
@@ -116,6 +240,74 @@ async def get_status():
         live_price=bot_state.get("live_price"),
         connected_to_exchange=bot_state.get("connected_to_exchange", False)
     )
+
+
+def _log_tail(log_path: Optional[str], n: int = 40) -> List[str]:
+    if not log_path:
+        return []
+    p = Path(log_path)
+    if not p.exists():
+        return []
+    try:
+        with p.open() as f:
+            lines = f.readlines()
+        return [l.rstrip("\n") for l in lines[-n:]]
+    except Exception:
+        return []
+
+
+@app.post("/api/runs/start", response_model=RunStatus)
+async def start_training(run: RunRequest):
+    """Lance un job train_v2 en tâche de fond."""
+    if run_state["status"] == "running":
+        return RunStatus(
+            run_id=run_state["run_id"],
+            status="busy",
+            pid=run_state["pid"],
+            params=run_state["params"],
+            start_time=run_state["start_time"],
+            end_time=run_state["end_time"],
+            log_path=run_state["log_path"],
+            metrics_path=run_state["metrics_path"],
+            history=run_history[-10:],
+        )
+    
+    asyncio.create_task(_run_training_job(run))
+    return RunStatus(
+        run_id=run_state["run_id"],
+        status="running",
+        pid=run_state["pid"],
+        params=run_state["params"],
+        start_time=run_state["start_time"],
+        end_time=run_state["end_time"],
+        log_path=run_state["log_path"],
+        metrics_path=run_state["metrics_path"],
+        last_lines=_log_tail(run_state["log_path"]),
+        history=run_history[-10:],
+    )
+
+
+@app.get("/api/runs/status", response_model=RunStatus)
+async def runs_status():
+    """Statut du job en cours + dernier log tail."""
+    return RunStatus(
+        run_id=run_state["run_id"],
+        status=run_state["status"],
+        pid=run_state["pid"],
+        params=run_state["params"],
+        start_time=run_state["start_time"],
+        end_time=run_state["end_time"],
+        log_path=run_state["log_path"],
+        metrics_path=run_state["metrics_path"],
+        last_lines=_log_tail(run_state["log_path"]),
+        history=run_history[-10:],
+    )
+
+
+@app.get("/api/runs/history")
+async def runs_history():
+    """Historique des jobs récents (20 derniers)."""
+    return {"history": run_history[-20:]}
 
 
 @app.get("/api/price/{base}/{quote}")

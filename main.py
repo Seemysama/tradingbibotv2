@@ -14,11 +14,14 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.ai.inference import InferenceEngine
-from src.config import settings
+from src.config import settings, ExchangeType
 from src.database import init_database, get_db
 from src.execution import ExecutionEngine
 from src.feed import Candle, FeedConfig, MarketFeed, create_feed
 from src.strategy import HybridStrategy
+from src.connectors.polymarket_feed import PolymarketFeed
+from src.connectors.polymarket_execution import PolymarketExecution
+from src.strategies.polymarket_strategy import PolymarketStrategy
 from state.models import (
     Order,
     OrderSide,
@@ -86,15 +89,6 @@ class TradingOrchestrator:
             self._current_position = open_positions[0]
             log.info(f"Position ouverte trouvée: {self._current_position.side} @ {self._current_position.entry_price}")
         
-        # Inference Engine
-        self.inference = InferenceEngine()
-        
-        # Strategy
-        self.strategy = HybridStrategy(inference=self.inference)
-        
-        # Execution Engine
-        self.execution = ExecutionEngine()
-        
         # Feed Configuration
         feed_config = FeedConfig(
             symbol=self.symbol,
@@ -102,9 +96,51 @@ class TradingOrchestrator:
             warmup_candles=settings.WARMUP_CANDLES,
             replay_speed=settings.REPLAY_SPEED_MS if self.mode != "BACKTEST" else 0,
         )
-        
-        # Créer le feed approprié
-        self.feed = create_feed(self.mode, feed_config)
+
+        # Creates the appropriate feed based on ExchangeType
+        if settings.EXCHANGE_TYPE == ExchangeType.POLYMARKET:
+            self.feed = PolymarketFeed(
+                feed_config,
+                api_key=settings.POLYMARKET_API_KEY,
+                private_key=settings.POLYMARKET_PRIVATE_KEY
+            )
+            # Polymarket specialized components
+            self.strategy = PolymarketStrategy()
+            self.inference = None  # Not used for Polymarket yet
+            
+            # Setup Execution Client
+            try:
+                from py_clob_client.client import ClobClient
+                from py_clob_client.clob_types import ApiCreds, ChainId
+
+                creds = ApiCreds(
+                    api_key=settings.POLYMARKET_API_KEY,
+                    api_secret=settings.POLYMARKET_SECRET,
+                    api_passphrase=settings.POLYMARKET_PASSPHRASE,
+                )
+                
+                # Use Polygon chain ID
+                chain_id = 137
+
+                # Initialize CLOB client
+                client = ClobClient(
+                     host="https://clob.polymarket.com",
+                     key=settings.POLYMARKET_PRIVATE_KEY,
+                     chain_id=chain_id,
+                     creds=creds,
+                     signature_type=1  # EOA
+                )
+                self.execution = PolymarketExecution(client)
+                log.info("Initialized Polymarket Execution Engine")
+            except Exception as e:
+                log.error(f"Failed to initialize Polymarket Execution: {e}")
+                self.execution = None  # Or a read-only mock
+        else:
+            # Standard CEX / Paper Trading
+            self.feed = create_feed(self.mode, feed_config)
+            self.inference = InferenceEngine()
+            self.strategy = HybridStrategy(inference=self.inference)
+            self.execution = ExecutionEngine()
         
         log.info("✅ Composants initialisés")
     

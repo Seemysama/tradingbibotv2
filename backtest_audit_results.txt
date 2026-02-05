@@ -1,0 +1,5 @@
+Verification Run: 2026-02-05 20:44:56.002752
+Data: 2884 candles (BTC/USDT 15m)
+Return: -11.40%
+Sharpe: -8.78
+Trades: 84
